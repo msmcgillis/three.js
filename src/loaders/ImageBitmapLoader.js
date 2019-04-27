@@ -22,6 +22,7 @@ function ImageBitmapLoader( manager ) {
 
 	this.manager = manager !== undefined ? manager : DefaultLoadingManager;
 	this.options = undefined;
+	this.responseType = 'imagebitmap';
 
 }
 
@@ -45,69 +46,41 @@ ImageBitmapLoader.prototype = {
 
 		url = this.manager.resolveURL( url );
 
-		var scope = this;
+		return Cache.get( this, url, onLoad, onProgress, onError );
 
-		var cached = Cache.get( url );
+	},
 
-		if ( cached !== undefined ) {
+	// must return XMLHttpRequest
+	request: function ( url ) {
 
-			scope.manager.itemStart( url );
+		var request = new XMLHttpRequest();
 
-			setTimeout( function () {
+		request.open( 'GET', url, true);
 
-				if ( onLoad ) onLoad( cached );
+		request.responseType = 'blob';
 
-				scope.manager.itemEnd( url );
+		return request;
 
-			}, 0 );
+	},
 
-			return cached;
+	// must return Promise
+	cacheload: function ( data ) {
+
+		var promise;
+
+		if ( this.options === undefined ) {
+
+			// Workaround for FireFox. It causes an error if you pass options.
+			promise = createImageBitmap( data );
+
+		} else {
+
+			promise = createImageBitmap( data, this.options );
 
 		}
 
-		fetch( url ).then( function ( res ) {
-
-			return res.blob();
-
-		} ).then( function ( blob ) {
-
-			if ( scope.options === undefined ) {
-
-				// Workaround for FireFox. It causes an error if you pass options.
-				return createImageBitmap( blob );
-
-			} else {
-
-				return createImageBitmap( blob, scope.options );
-
-			}
-
-		} ).then( function ( imageBitmap ) {
-
-			Cache.add( url, imageBitmap );
-
-			if ( onLoad ) onLoad( imageBitmap );
-
-			scope.manager.itemEnd( url );
-
-		} ).catch( function ( e ) {
-
-			if ( onError ) onError( e );
-
-			scope.manager.itemError( url );
-			scope.manager.itemEnd( url );
-
-		} );
-
-		scope.manager.itemStart( url );
-
-	},
-
-	setCrossOrigin: function ( /* value */ ) {
-
-		return this;
-
-	},
+		return promise;
+        },
 
 	setPath: function ( value ) {
 

@@ -9,12 +9,11 @@ import { DefaultLoadingManager } from './LoadingManager.js';
 function ImageLoader( manager ) {
 
 	this.manager = ( manager !== undefined ) ? manager : DefaultLoadingManager;
+	this.responseType = 'image';
 
 }
 
 Object.assign( ImageLoader.prototype, {
-
-	crossOrigin: 'anonymous',
 
 	load: function ( url, onLoad, onProgress, onError ) {
 
@@ -24,74 +23,37 @@ Object.assign( ImageLoader.prototype, {
 
 		url = this.manager.resolveURL( url );
 
-		var scope = this;
-
-		var cached = Cache.get( url );
-
-		if ( cached !== undefined ) {
-
-			scope.manager.itemStart( url );
-
-			setTimeout( function () {
-
-				if ( onLoad ) onLoad( cached );
-
-				scope.manager.itemEnd( url );
-
-			}, 0 );
-
-			return cached;
-
-		}
-
-		var image = document.createElementNS( 'http://www.w3.org/1999/xhtml', 'img' );
-
-		function onImageLoad() {
-
-			image.removeEventListener( 'load', onImageLoad, false );
-			image.removeEventListener( 'error', onImageError, false );
-
-			Cache.add( url, this );
-
-			if ( onLoad ) onLoad( this );
-
-			scope.manager.itemEnd( url );
-
-		}
-
-		function onImageError( event ) {
-
-			image.removeEventListener( 'load', onImageLoad, false );
-			image.removeEventListener( 'error', onImageError, false );
-
-			if ( onError ) onError( event );
-
-			scope.manager.itemError( url );
-			scope.manager.itemEnd( url );
-
-		}
-
-		image.addEventListener( 'load', onImageLoad, false );
-		image.addEventListener( 'error', onImageError, false );
-
-		if ( url.substr( 0, 5 ) !== 'data:' ) {
-
-			if ( this.crossOrigin !== undefined ) image.crossOrigin = this.crossOrigin;
-
-		}
-
-		scope.manager.itemStart( url );
-
-		image.src = url;
-
-		return image;
+		return Cache.get( this, url, onLoad, onProgress, onError);
 
 	},
 
-	setCrossOrigin: function ( value ) {
+	// must return XMLHttpRequest
+	request: function ( url ) {
 
-		this.crossOrigin = value;
-		return this;
+		var request = new XMLHttpRequest();
+
+		request.open( 'GET', url, true );
+
+		request.responseType = 'blob';
+
+		return request;
+
+	},
+
+	// must return Promise
+	cacheload: function ( data ) {
+
+		var image = document.createElementNS('http://www.w3.org/1999/xhtml','img');
+
+		var url = URL.createObjectURL(data);
+
+                image.src = url;
+
+                image.onload = function() {
+                  URL.revokeObjectURL(url);
+                };
+
+		return Promise.resolve(image);
 
 	},
 

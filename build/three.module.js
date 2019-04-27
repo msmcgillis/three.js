@@ -34526,41 +34526,424 @@ Object.assign( AnimationClip.prototype, {
  * @author mrdoob / http://mrdoob.com/
  */
 
+// to detect duplicate requests we track all loading request in this hash
+// by loading.<key>.load = [ {loader, onLoad, onProgress, onError}, ...  ]
+// by loading.<key>.manager = [ <manager>, ... ]
+var loading = {};
+
+var dataUriRegex = /^data:(.*?)(;base64)?,(.*)$/;
+
 var Cache = {
 
 	enabled: false,
 
 	files: {},
 
-	add: function ( key, file ) {
+	add: function ( type, key, file ) {
 
 		if ( this.enabled === false ) return;
 
 		// console.log( 'THREE.Cache', 'Adding key:', key );
 
-		this.files[ key ] = file;
+                if (! (type in this.files) ) this.files[ type ] = {};
+
+		this.files[ type ][ key ] = file;
 
 	},
 
-	get: function ( key ) {
+	get: function ( loader, key, onLoad, onProgress, onError) {
 
-		if ( this.enabled === false ) return;
+		if ( this.enabled ) {
 
-		// console.log( 'THREE.Cache', 'Checking key:', key );
+			// console.log( 'THREE.Cache', 'Checking key:', key );
 
-		return this.files[ key ];
+			if (loader.constructor.name in this.files &&
+			    key in this.files[loader.constructor.name]) {
+
+				loader.manager.itemStart( key );
+
+				var response = this.files[ loader.constructor.name ][ key ];
+
+				setTimeout( function () {
+
+					if ( onLoad ) onLoad( response );
+
+					loader.manager.itemEnd( key );
+
+				}, 0 );
+
+				return response;
+			}
+
+		}
+
+		// Check if request is duplicate
+
+		if ( loading[ key ] !== undefined ) {
+
+			if ( ! loading[ key ].manager.includes(loader.manager) ) {
+
+				loader.manager.itemStart( key );
+
+				loading[ key ].manager.push(loader.manager);
+
+			}
+
+			loading[ key ].load.push( {
+
+				loader: loader,
+				onLoad: onLoad,
+				onProgress: onProgress,
+				onError: onError
+
+			} );
+
+			return;
+
+		}
+
+		var dataUriRegexResult = key.match( dataUriRegex );
+
+		if ( dataUriRegexResult ) {
+
+			loader.manager.itemStart( key );
+
+			this.dataURI(key, loader, onLoad, dataUriRegexResult);
+
+			loader.manager.itemEnd( key );
+
+			return;
+
+		} else {
+
+			// Initialize callback for duplicate request
+
+			loading[ key ] = {
+				manager: [],
+				load: []
+			};
+
+			loading[ key ].manager.push( loader.manager );
+
+			loading[ key ].load.push( {
+
+				loader: loader,
+				onLoad: onLoad,
+				onProgress: onProgress,
+				onError: onError
+
+			} );
+
+			// get key
+
+			var request = loader.request( key );
+
+			request.addEventListener( 'load', this.load.bind(this,key) );
+			request.addEventListener( 'progress', this.progress.bind(this,key) );
+			request.addEventListener( 'error', this.error.bind(this,key) );
+			request.addEventListener( 'abort', this.abort.bind(this,key) );
+
+			request.send( null );
+
+			loader.manager.itemStart( key );
+
+			return request;
+
+		}
 
 	},
 
-	remove: function ( key ) {
+	remove: function ( type, key ) {
 
-		delete this.files[ key ];
+		delete this.files[ type ][ key ];
 
 	},
 
 	clear: function () {
 
 		this.files = {};
+
+	},
+
+	uniquetypes: function(key) {
+
+		var unique = [], found = {};
+
+		for (var i in loading[key].load) {
+
+			if (! (loading[key].load[i].loader.constructor.name in found)) {
+
+				unique.push(loading[key].load[i].loader);
+
+				found[loading[key].load[i].loader.constructor.name]=1;
+
+			}
+
+		}
+
+		return unique;
+
+	},
+
+	resultprocess: function ( loader, data ) {
+
+		return loader.cacheload(data); // cacheload must return a promise
+
+	},
+
+	load: function ( key, event ) {
+
+		if ( event.target.status === 200 || event.target.status === 0 ) {
+
+			// Some browsers return HTTP Status 0 when using non-http protocol
+			// e.g. 'file://' or 'data://'. Handle as success.
+
+			if ( event.target.status === 0 ) console.warn( 'THREE.Cache: HTTP Status 0 received.' );
+
+			var response = event.target.response;
+
+			this.add( event.target.constructor.name, key, response );
+
+			// perform each unique loader result processing
+
+			var unique = this.uniquetypes(key);
+                        var rp = this.resultprocess.bind(this);
+                        var a = this.add.bind(this);
+
+			Promise.all( unique.map( function(loader) { 
+					return rp(loader,
+						response).catch(function(error) {
+						return error;
+						});
+					}
+				)
+			).then(function(results) {
+
+				// all processed now do house keeping
+
+				// index results by loader type
+				var indexed = {};
+
+				for (var i in results) {
+
+					indexed[unique[i].constructor.name] = results[i];
+
+					// cache all valid results
+					if (! (results[i].constructor.name == 'Error')) {
+
+						a( unique[i].constructor.name, key, results[i] );
+
+					}
+
+				}
+
+				// generate all appropriate events for
+				// managers/loaders based on key results
+				var callbacks = loading[ key ];
+
+				delete loading[ key ];
+
+				for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+					var callback = callbacks.load[ i ];
+
+					if (indexed[callback.loader.constructor.name] == 'Error') {
+						var error = indexed[callback.loader.constructor.name];
+						if ( callback.onError ) callback.onError( error );
+
+						callback.loader.manager.itemError( key );
+					} else {
+						var data = indexed[callback.loader.constructor.name];
+
+						if ( callback.onLoad ) callback.onLoad( data );
+					}
+
+				}
+
+				// notify managers we are done.
+				for (var i = 0, il = callbacks.manager.length; i < il; i++) {
+
+					var manager = callbacks.manager[ i ];
+					manager.itemEnd( key );
+
+				}
+
+
+			});
+
+		} else {
+
+			var callbacks = loading[ key ];
+
+			delete loading[ key ];
+
+			for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+				var callback = callbacks.load[ i ];
+				if ( callback.onError ) callback.onError( event );
+
+			}
+
+			for (var i = 0, il = callbacks.manager.length; i < il; i++) {
+
+				var manager = callbacks.manager[ i ];
+				manager.itemError( key );
+				manager.itemEnd( key );
+
+			}
+
+		}
+	},
+
+	progress: function ( key, event ) {
+
+		var callbacks = loading[ key ];
+
+		for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+			var callback = callbacks.load[ i ];
+			if ( callback.onProgress ) callback.onProgress( event );
+
+		}
+
+	},
+
+	error: function ( key, event ) {
+
+		var callbacks = loading[ key ];
+
+		delete loading[ key ];
+
+		for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+			var callback = callbacks.load[ i ];
+			if ( callback.onError ) callback.onError( event );
+
+		}
+
+		for (var i = 0, il = callbacks.manager.length; i < il; i++) {
+
+			var manager = callbacks.manager[ i ];
+			manager.itemError( key );
+			manager.itemEnd( key );
+
+		}
+
+	},
+
+	abort: function ( key, event ) {
+
+		var callbacks = loading[ key ];
+
+		delete loading[ key ];
+
+		for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+			var callback = callbacks.load[ i ];
+			if ( callback.onError ) callback.onError( event );
+
+		}
+
+		for (var i = 0, il = callbacks.manager.length; i < il; i++) {
+
+			var manager = callbacks.manager[ i ];
+			manager.itemError( key );
+			manager.itemEnd( key );
+
+		}
+
+	},
+
+
+	dataURI: function ( key, loader, onLoad, result ) {
+
+		var mimeType = result[ 1 ];
+		var isBase64 = !! result[ 2 ];
+		var data = result[ 3 ];
+
+		data = decodeURIComponent( data );
+
+		if ( isBase64 ) data = atob( data );
+
+		try {
+
+			var response;
+			var responseType = ( loader.responseType || '' ).toLowerCase();
+
+			switch ( responseType ) {
+
+				case 'arraybuffer':
+				case 'blob':
+
+					var view = new Uint8Array( data.length );
+
+					for ( var i = 0; i < data.length; i ++ ) {
+
+						view[ i ] = data.charCodeAt( i );
+
+					}
+
+					if ( responseType === 'blob' ) {
+
+						response = new Blob( [ view.buffer ], { type: mimeType } );
+
+					} else {
+
+						response = view.buffer;
+
+					}
+
+					break;
+
+				case 'image':
+				case 'imagebitmap':
+					var i = document.createElement('img');
+					i.src = key;
+					response = i;
+
+					break;
+				case 'document':
+
+					var parser = new DOMParser();
+					response = parser.parseFromString( data, mimeType );
+
+					break;
+
+				case 'json':
+
+					response = JSON.parse( data );
+
+					break;
+
+				default: // 'text' or other
+
+					response = data;
+
+					break;
+
+			}
+
+
+			// Wait for next browser tick like standard XMLHttpRequest event dispatching does
+			setTimeout( function () {
+
+				if ( onLoad ) onLoad( response );
+
+				loader.manager.itemEnd( key );
+
+			}, 0 );
+
+		} catch ( error ) {
+
+			// Wait for next browser tick like standard XMLHttpRequest event dispatching does
+			setTimeout( function () {
+
+				loader.manager.itemError( key );
+				loader.manager.itemEnd( key );
+
+			}, 0 );
+
+		}
 
 	}
 
@@ -34666,8 +35049,6 @@ var DefaultLoadingManager = new LoadingManager();
  * @author mrdoob / http://mrdoob.com/
  */
 
-var loading = {};
-
 function FileLoader( manager ) {
 
 	this.manager = ( manager !== undefined ) ? manager : DefaultLoadingManager;
@@ -34684,258 +35065,36 @@ Object.assign( FileLoader.prototype, {
 
 		url = this.manager.resolveURL( url );
 
-		var scope = this;
+		return Cache.get( this, url, onLoad, onProgress, onError );
 
-		var cached = Cache.get( url );
+	},
 
-		if ( cached !== undefined ) {
+	// must return XMLHttpRequest
+	request: function ( url ) {
 
-			scope.manager.itemStart( url );
+		var request = new XMLHttpRequest();
 
-			setTimeout( function () {
+		request.open( 'GET', url, true );
 
-				if ( onLoad ) onLoad( cached );
+		if ( this.responseType !== undefined ) request.responseType = this.responseType;
+		if ( this.withCredentials !== undefined ) request.withCredentials = this.withCredentials;
 
-				scope.manager.itemEnd( url );
+		if ( request.overrideMimeType ) request.overrideMimeType( this.mimeType !== undefined ? this.mimeType : 'text/plain' );
 
-			}, 0 );
+		for ( var header in this.requestHeader ) {
 
-			return cached;
-
-		}
-
-		// Check if request is duplicate
-
-		if ( loading[ url ] !== undefined ) {
-
-			loading[ url ].push( {
-
-				onLoad: onLoad,
-				onProgress: onProgress,
-				onError: onError
-
-			} );
-
-			return;
+			request.setRequestHeader( header, this.requestHeader[ header ] );
 
 		}
-
-		// Check for data: URI
-		var dataUriRegex = /^data:(.*?)(;base64)?,(.*)$/;
-		var dataUriRegexResult = url.match( dataUriRegex );
-
-		// Safari can not handle Data URIs through XMLHttpRequest so process manually
-		if ( dataUriRegexResult ) {
-
-			var mimeType = dataUriRegexResult[ 1 ];
-			var isBase64 = !! dataUriRegexResult[ 2 ];
-			var data = dataUriRegexResult[ 3 ];
-
-			data = decodeURIComponent( data );
-
-			if ( isBase64 ) data = atob( data );
-
-			try {
-
-				var response;
-				var responseType = ( this.responseType || '' ).toLowerCase();
-
-				switch ( responseType ) {
-
-					case 'arraybuffer':
-					case 'blob':
-
-						var view = new Uint8Array( data.length );
-
-						for ( var i = 0; i < data.length; i ++ ) {
-
-							view[ i ] = data.charCodeAt( i );
-
-						}
-
-						if ( responseType === 'blob' ) {
-
-							response = new Blob( [ view.buffer ], { type: mimeType } );
-
-						} else {
-
-							response = view.buffer;
-
-						}
-
-						break;
-
-					case 'document':
-
-						var parser = new DOMParser();
-						response = parser.parseFromString( data, mimeType );
-
-						break;
-
-					case 'json':
-
-						response = JSON.parse( data );
-
-						break;
-
-					default: // 'text' or other
-
-						response = data;
-
-						break;
-
-				}
-
-				// Wait for next browser tick like standard XMLHttpRequest event dispatching does
-				setTimeout( function () {
-
-					if ( onLoad ) onLoad( response );
-
-					scope.manager.itemEnd( url );
-
-				}, 0 );
-
-			} catch ( error ) {
-
-				// Wait for next browser tick like standard XMLHttpRequest event dispatching does
-				setTimeout( function () {
-
-					if ( onError ) onError( error );
-
-					scope.manager.itemError( url );
-					scope.manager.itemEnd( url );
-
-				}, 0 );
-
-			}
-
-		} else {
-
-			// Initialise array for duplicate requests
-
-			loading[ url ] = [];
-
-			loading[ url ].push( {
-
-				onLoad: onLoad,
-				onProgress: onProgress,
-				onError: onError
-
-			} );
-
-			var request = new XMLHttpRequest();
-
-			request.open( 'GET', url, true );
-
-			request.addEventListener( 'load', function ( event ) {
-
-				var response = this.response;
-
-				Cache.add( url, response );
-
-				var callbacks = loading[ url ];
-
-				delete loading[ url ];
-
-				if ( this.status === 200 || this.status === 0 ) {
-
-					// Some browsers return HTTP Status 0 when using non-http protocol
-					// e.g. 'file://' or 'data://'. Handle as success.
-
-					if ( this.status === 0 ) console.warn( 'THREE.FileLoader: HTTP Status 0 received.' );
-
-					for ( var i = 0, il = callbacks.length; i < il; i ++ ) {
-
-						var callback = callbacks[ i ];
-						if ( callback.onLoad ) callback.onLoad( response );
-
-					}
-
-					scope.manager.itemEnd( url );
-
-				} else {
-
-					for ( var i = 0, il = callbacks.length; i < il; i ++ ) {
-
-						var callback = callbacks[ i ];
-						if ( callback.onError ) callback.onError( event );
-
-					}
-
-					scope.manager.itemError( url );
-					scope.manager.itemEnd( url );
-
-				}
-
-			}, false );
-
-			request.addEventListener( 'progress', function ( event ) {
-
-				var callbacks = loading[ url ];
-
-				for ( var i = 0, il = callbacks.length; i < il; i ++ ) {
-
-					var callback = callbacks[ i ];
-					if ( callback.onProgress ) callback.onProgress( event );
-
-				}
-
-			}, false );
-
-			request.addEventListener( 'error', function ( event ) {
-
-				var callbacks = loading[ url ];
-
-				delete loading[ url ];
-
-				for ( var i = 0, il = callbacks.length; i < il; i ++ ) {
-
-					var callback = callbacks[ i ];
-					if ( callback.onError ) callback.onError( event );
-
-				}
-
-				scope.manager.itemError( url );
-				scope.manager.itemEnd( url );
-
-			}, false );
-
-			request.addEventListener( 'abort', function ( event ) {
-
-				var callbacks = loading[ url ];
-
-				delete loading[ url ];
-
-				for ( var i = 0, il = callbacks.length; i < il; i ++ ) {
-
-					var callback = callbacks[ i ];
-					if ( callback.onError ) callback.onError( event );
-
-				}
-
-				scope.manager.itemError( url );
-				scope.manager.itemEnd( url );
-
-			}, false );
-
-			if ( this.responseType !== undefined ) request.responseType = this.responseType;
-			if ( this.withCredentials !== undefined ) request.withCredentials = this.withCredentials;
-
-			if ( request.overrideMimeType ) request.overrideMimeType( this.mimeType !== undefined ? this.mimeType : 'text/plain' );
-
-			for ( var header in this.requestHeader ) {
-
-				request.setRequestHeader( header, this.requestHeader[ header ] );
-
-			}
-
-			request.send( null );
-
-		}
-
-		scope.manager.itemStart( url );
 
 		return request;
+
+	},
+
+	// must return Promise
+	cacheload: function ( data ) {
+
+		return Promise.resolve(data);
 
 	},
 
@@ -35264,12 +35423,11 @@ Object.assign( DataTextureLoader.prototype, {
 function ImageLoader( manager ) {
 
 	this.manager = ( manager !== undefined ) ? manager : DefaultLoadingManager;
+	this.responseType = 'image';
 
 }
 
 Object.assign( ImageLoader.prototype, {
-
-	crossOrigin: 'anonymous',
 
 	load: function ( url, onLoad, onProgress, onError ) {
 
@@ -35279,74 +35437,37 @@ Object.assign( ImageLoader.prototype, {
 
 		url = this.manager.resolveURL( url );
 
-		var scope = this;
-
-		var cached = Cache.get( url );
-
-		if ( cached !== undefined ) {
-
-			scope.manager.itemStart( url );
-
-			setTimeout( function () {
-
-				if ( onLoad ) onLoad( cached );
-
-				scope.manager.itemEnd( url );
-
-			}, 0 );
-
-			return cached;
-
-		}
-
-		var image = document.createElementNS( 'http://www.w3.org/1999/xhtml', 'img' );
-
-		function onImageLoad() {
-
-			image.removeEventListener( 'load', onImageLoad, false );
-			image.removeEventListener( 'error', onImageError, false );
-
-			Cache.add( url, this );
-
-			if ( onLoad ) onLoad( this );
-
-			scope.manager.itemEnd( url );
-
-		}
-
-		function onImageError( event ) {
-
-			image.removeEventListener( 'load', onImageLoad, false );
-			image.removeEventListener( 'error', onImageError, false );
-
-			if ( onError ) onError( event );
-
-			scope.manager.itemError( url );
-			scope.manager.itemEnd( url );
-
-		}
-
-		image.addEventListener( 'load', onImageLoad, false );
-		image.addEventListener( 'error', onImageError, false );
-
-		if ( url.substr( 0, 5 ) !== 'data:' ) {
-
-			if ( this.crossOrigin !== undefined ) image.crossOrigin = this.crossOrigin;
-
-		}
-
-		scope.manager.itemStart( url );
-
-		image.src = url;
-
-		return image;
+		return Cache.get( this, url, onLoad, onProgress, onError);
 
 	},
 
-	setCrossOrigin: function ( value ) {
+	// must return XMLHttpRequest
+	request: function ( url ) {
 
-		this.crossOrigin = value;
-		return this;
+		var request = new XMLHttpRequest();
+
+		request.open( 'GET', url, true );
+
+		request.responseType = 'blob';
+
+		return request;
+
+	},
+
+	// must return Promise
+	cacheload: function ( data ) {
+
+		var image = document.createElementNS('http://www.w3.org/1999/xhtml','img');
+
+		var url = URL.createObjectURL(data);
+
+                image.src = url;
+
+                image.onload = function() {
+                  URL.revokeObjectURL(url);
+                };
+
+		return Promise.resolve(image);
 
 	},
 
@@ -39585,6 +39706,7 @@ function ImageBitmapLoader( manager ) {
 
 	this.manager = manager !== undefined ? manager : DefaultLoadingManager;
 	this.options = undefined;
+	this.responseType = 'imagebitmap';
 
 }
 
@@ -39608,69 +39730,41 @@ ImageBitmapLoader.prototype = {
 
 		url = this.manager.resolveURL( url );
 
-		var scope = this;
+		return Cache.get( this, url, onLoad, onProgress, onError );
 
-		var cached = Cache.get( url );
+	},
 
-		if ( cached !== undefined ) {
+	// must return XMLHttpRequest
+	request: function ( url ) {
 
-			scope.manager.itemStart( url );
+		var request = new XMLHttpRequest();
 
-			setTimeout( function () {
+		request.open( 'GET', url, true);
 
-				if ( onLoad ) onLoad( cached );
+		request.responseType = 'blob';
 
-				scope.manager.itemEnd( url );
+		return request;
 
-			}, 0 );
+	},
 
-			return cached;
+	// must return Promise
+	cacheload: function ( data ) {
+
+		var promise;
+
+		if ( this.options === undefined ) {
+
+			// Workaround for FireFox. It causes an error if you pass options.
+			promise = createImageBitmap( data );
+
+		} else {
+
+			promise = createImageBitmap( data, this.options );
 
 		}
 
-		fetch( url ).then( function ( res ) {
-
-			return res.blob();
-
-		} ).then( function ( blob ) {
-
-			if ( scope.options === undefined ) {
-
-				// Workaround for FireFox. It causes an error if you pass options.
-				return createImageBitmap( blob );
-
-			} else {
-
-				return createImageBitmap( blob, scope.options );
-
-			}
-
-		} ).then( function ( imageBitmap ) {
-
-			Cache.add( url, imageBitmap );
-
-			if ( onLoad ) onLoad( imageBitmap );
-
-			scope.manager.itemEnd( url );
-
-		} ).catch( function ( e ) {
-
-			if ( onError ) onError( e );
-
-			scope.manager.itemError( url );
-			scope.manager.itemEnd( url );
-
-		} );
-
-		scope.manager.itemStart( url );
-
-	},
-
-	setCrossOrigin: function ( /* value */ ) {
-
-		return this;
-
-	},
+		return promise;
+        },
 
 	setPath: function ( value ) {
 
@@ -48844,4 +48938,4 @@ function LensFlare() {
 
 }
 
-export { ACESFilmicToneMapping, AddEquation, AddOperation, AdditiveBlending, AlphaFormat, AlwaysDepth, AmbientLight, AmbientLightProbe, AnimationClip, AnimationLoader, AnimationMixer, AnimationObjectGroup, AnimationUtils, ArcCurve, ArrayCamera, ArrowHelper, Audio, AudioAnalyser, AudioContext, AudioListener, AudioLoader, AxesHelper, AxisHelper, BackSide, BasicDepthPacking, BasicShadowMap, BinaryTextureLoader, Bone, BooleanKeyframeTrack, BoundingBoxHelper, Box2, Box3, Box3Helper, BoxBufferGeometry, BoxGeometry, BoxHelper, BufferAttribute, BufferGeometry, BufferGeometryLoader, ByteType, Cache, Camera, CameraHelper, CanvasRenderer, CanvasTexture, CatmullRomCurve3, CineonToneMapping, CircleBufferGeometry, CircleGeometry, ClampToEdgeWrapping, Clock, ClosedSplineCurve3, Color, ColorKeyframeTrack, CompressedTexture, CompressedTextureLoader, ConeBufferGeometry, ConeGeometry, CubeCamera, BoxGeometry as CubeGeometry, CubeReflectionMapping, CubeRefractionMapping, CubeTexture, CubeTextureLoader, CubeUVReflectionMapping, CubeUVRefractionMapping, CubicBezierCurve, CubicBezierCurve3, CubicInterpolant, CullFaceBack, CullFaceFront, CullFaceFrontBack, CullFaceNone, Curve, CurvePath, CustomBlending, CylinderBufferGeometry, CylinderGeometry, Cylindrical, DataTexture, DataTexture2DArray, DataTexture3D, DataTextureLoader, DefaultLoadingManager, DepthFormat, DepthStencilFormat, DepthTexture, DirectionalLight, DirectionalLightHelper, DirectionalLightShadow, DiscreteInterpolant, DodecahedronBufferGeometry, DodecahedronGeometry, DoubleSide, DstAlphaFactor, DstColorFactor, DynamicBufferAttribute, EdgesGeometry, EdgesHelper, EllipseCurve, EqualDepth, EquirectangularReflectionMapping, EquirectangularRefractionMapping, Euler, EventDispatcher, ExtrudeBufferGeometry, ExtrudeGeometry, Face3, Face4, FaceColors, FaceNormalsHelper, FileLoader, FlatShading, Float32Attribute, Float32BufferAttribute, Float64Attribute, Float64BufferAttribute, FloatType, Fog, FogExp2, Font, FontLoader, FrontFaceDirectionCCW, FrontFaceDirectionCW, FrontSide, Frustum, GammaEncoding, Geometry, GeometryUtils, GreaterDepth, GreaterEqualDepth, GridHelper, Group, HalfFloatType, HemisphereLight, HemisphereLightHelper, HemisphereLightProbe, IcosahedronBufferGeometry, IcosahedronGeometry, ImageBitmapLoader, ImageLoader, ImageUtils, ImmediateRenderObject, InstancedBufferAttribute, InstancedBufferGeometry, InstancedInterleavedBuffer, Int16Attribute, Int16BufferAttribute, Int32Attribute, Int32BufferAttribute, Int8Attribute, Int8BufferAttribute, IntType, InterleavedBuffer, InterleavedBufferAttribute, Interpolant, InterpolateDiscrete, InterpolateLinear, InterpolateSmooth, JSONLoader, KeyframeTrack, LOD, LatheBufferGeometry, LatheGeometry, Layers, LensFlare, LessDepth, LessEqualDepth, Light, LightProbe, LightProbeHelper, LightShadow, Line, Line3, LineBasicMaterial, LineCurve, LineCurve3, LineDashedMaterial, LineLoop, LinePieces, LineSegments, LineStrip, LinearEncoding, LinearFilter, LinearInterpolant, LinearMipMapLinearFilter, LinearMipMapNearestFilter, LinearToneMapping, Loader, LoaderUtils, LoadingManager, LogLuvEncoding, LoopOnce, LoopPingPong, LoopRepeat, LuminanceAlphaFormat, LuminanceFormat, MOUSE, Material, MaterialLoader, _Math as Math, Matrix3, Matrix4, MaxEquation, Mesh, MeshBasicMaterial, MeshDepthMaterial, MeshDistanceMaterial, MeshFaceMaterial, MeshLambertMaterial, MeshMatcapMaterial, MeshNormalMaterial, MeshPhongMaterial, MeshPhysicalMaterial, MeshStandardMaterial, MeshToonMaterial, MinEquation, MirroredRepeatWrapping, MixOperation, MultiMaterial, MultiplyBlending, MultiplyOperation, NearestFilter, NearestMipMapLinearFilter, NearestMipMapNearestFilter, NeverDepth, NoBlending, NoColors, NoToneMapping, NormalBlending, NotEqualDepth, NumberKeyframeTrack, Object3D, ObjectLoader, ObjectSpaceNormalMap, OctahedronBufferGeometry, OctahedronGeometry, OneFactor, OneMinusDstAlphaFactor, OneMinusDstColorFactor, OneMinusSrcAlphaFactor, OneMinusSrcColorFactor, OrthographicCamera, PCFShadowMap, PCFSoftShadowMap, ParametricBufferGeometry, ParametricGeometry, Particle, ParticleBasicMaterial, ParticleSystem, ParticleSystemMaterial, Path, PerspectiveCamera, Plane, PlaneBufferGeometry, PlaneGeometry, PlaneHelper, PointCloud, PointCloudMaterial, PointLight, PointLightHelper, Points, PointsMaterial, PolarGridHelper, PolyhedronBufferGeometry, PolyhedronGeometry, PositionalAudio, PositionalAudioHelper, PropertyBinding, PropertyMixer, QuadraticBezierCurve, QuadraticBezierCurve3, Quaternion, QuaternionKeyframeTrack, QuaternionLinearInterpolant, REVISION, RGBADepthPacking, RGBAFormat, RGBA_ASTC_10x10_Format, RGBA_ASTC_10x5_Format, RGBA_ASTC_10x6_Format, RGBA_ASTC_10x8_Format, RGBA_ASTC_12x10_Format, RGBA_ASTC_12x12_Format, RGBA_ASTC_4x4_Format, RGBA_ASTC_5x4_Format, RGBA_ASTC_5x5_Format, RGBA_ASTC_6x5_Format, RGBA_ASTC_6x6_Format, RGBA_ASTC_8x5_Format, RGBA_ASTC_8x6_Format, RGBA_ASTC_8x8_Format, RGBA_PVRTC_2BPPV1_Format, RGBA_PVRTC_4BPPV1_Format, RGBA_S3TC_DXT1_Format, RGBA_S3TC_DXT3_Format, RGBA_S3TC_DXT5_Format, RGBDEncoding, RGBEEncoding, RGBEFormat, RGBFormat, RGBM16Encoding, RGBM7Encoding, RGB_ETC1_Format, RGB_PVRTC_2BPPV1_Format, RGB_PVRTC_4BPPV1_Format, RGB_S3TC_DXT1_Format, RawShaderMaterial, Ray, Raycaster, RectAreaLight, RectAreaLightHelper, RedFormat, ReinhardToneMapping, RepeatWrapping, ReverseSubtractEquation, RingBufferGeometry, RingGeometry, Scene, SceneUtils, ShaderChunk, ShaderLib, ShaderMaterial, ShadowMaterial, Shape, ShapeBufferGeometry, ShapeGeometry, ShapePath, ShapeUtils, ShortType, Skeleton, SkeletonHelper, SkinnedMesh, SmoothShading, Sphere, SphereBufferGeometry, SphereGeometry, Spherical, SphericalHarmonics3, SphericalReflectionMapping, Spline, SplineCurve, SplineCurve3, SpotLight, SpotLightHelper, SpotLightShadow, Sprite, SpriteMaterial, SrcAlphaFactor, SrcAlphaSaturateFactor, SrcColorFactor, StereoCamera, StringKeyframeTrack, SubtractEquation, SubtractiveBlending, TangentSpaceNormalMap, TetrahedronBufferGeometry, TetrahedronGeometry, TextBufferGeometry, TextGeometry, Texture, TextureLoader, TorusBufferGeometry, TorusGeometry, TorusKnotBufferGeometry, TorusKnotGeometry, Triangle, TriangleFanDrawMode, TriangleStripDrawMode, TrianglesDrawMode, TubeBufferGeometry, TubeGeometry, UVMapping, Uint16Attribute, Uint16BufferAttribute, Uint32Attribute, Uint32BufferAttribute, Uint8Attribute, Uint8BufferAttribute, Uint8ClampedAttribute, Uint8ClampedBufferAttribute, Uncharted2ToneMapping, Uniform, UniformsLib, UniformsUtils, UnsignedByteType, UnsignedInt248Type, UnsignedIntType, UnsignedShort4444Type, UnsignedShort5551Type, UnsignedShort565Type, UnsignedShortType, Vector2, Vector3, Vector4, VectorKeyframeTrack, Vertex, VertexColors, VertexNormalsHelper, VideoTexture, WebGLMultisampleRenderTarget, WebGLRenderTarget, WebGLRenderTargetCube, WebGLRenderer, WebGLUtils, WireframeGeometry, WireframeHelper, WrapAroundEnding, XHRLoader, ZeroCurvatureEnding, ZeroFactor, ZeroSlopeEnding, sRGBEncoding };
+export { WebGLMultisampleRenderTarget, WebGLRenderTargetCube, WebGLRenderTarget, WebGLRenderer, ShaderLib, UniformsLib, UniformsUtils, ShaderChunk, FogExp2, Fog, Scene, Sprite, LOD, SkinnedMesh, Skeleton, Bone, Mesh, LineSegments, LineLoop, Line, Points, Group, VideoTexture, DataTexture, DataTexture2DArray, DataTexture3D, CompressedTexture, CubeTexture, CanvasTexture, DepthTexture, Texture, AnimationLoader, CompressedTextureLoader, DataTextureLoader, CubeTextureLoader, TextureLoader, ObjectLoader, MaterialLoader, BufferGeometryLoader, DefaultLoadingManager, LoadingManager, ImageLoader, ImageBitmapLoader, FontLoader, FileLoader, Loader, LoaderUtils, Cache, AudioLoader, SpotLightShadow, SpotLight, PointLight, RectAreaLight, HemisphereLight, HemisphereLightProbe, DirectionalLightShadow, DirectionalLight, AmbientLight, AmbientLightProbe, LightShadow, Light, LightProbe, StereoCamera, PerspectiveCamera, OrthographicCamera, CubeCamera, ArrayCamera, Camera, AudioListener, PositionalAudio, AudioContext, AudioAnalyser, Audio, VectorKeyframeTrack, StringKeyframeTrack, QuaternionKeyframeTrack, NumberKeyframeTrack, ColorKeyframeTrack, BooleanKeyframeTrack, PropertyMixer, PropertyBinding, KeyframeTrack, AnimationUtils, AnimationObjectGroup, AnimationMixer, AnimationClip, Uniform, InstancedBufferGeometry, BufferGeometry, Geometry, InterleavedBufferAttribute, InstancedInterleavedBuffer, InterleavedBuffer, InstancedBufferAttribute, Face3, Object3D, Raycaster, Layers, EventDispatcher, Clock, QuaternionLinearInterpolant, LinearInterpolant, DiscreteInterpolant, CubicInterpolant, Interpolant, Triangle, _Math as Math, Spherical, Cylindrical, Plane, Frustum, Sphere, Ray, Matrix4, Matrix3, Box3, Box2, Line3, Euler, Vector4, Vector3, Vector2, Quaternion, Color, SphericalHarmonics3, ImmediateRenderObject, VertexNormalsHelper, SpotLightHelper, SkeletonHelper, PointLightHelper, RectAreaLightHelper, HemisphereLightHelper, LightProbeHelper, GridHelper, PolarGridHelper, PositionalAudioHelper, FaceNormalsHelper, DirectionalLightHelper, CameraHelper, BoxHelper, Box3Helper, PlaneHelper, ArrowHelper, AxesHelper, Shape, Path, ShapePath, Font, CurvePath, Curve, ImageUtils, ShapeUtils, WebGLUtils, WireframeGeometry, ParametricGeometry, ParametricBufferGeometry, TetrahedronGeometry, TetrahedronBufferGeometry, OctahedronGeometry, OctahedronBufferGeometry, IcosahedronGeometry, IcosahedronBufferGeometry, DodecahedronGeometry, DodecahedronBufferGeometry, PolyhedronGeometry, PolyhedronBufferGeometry, TubeGeometry, TubeBufferGeometry, TorusKnotGeometry, TorusKnotBufferGeometry, TorusGeometry, TorusBufferGeometry, TextGeometry, TextBufferGeometry, SphereGeometry, SphereBufferGeometry, RingGeometry, RingBufferGeometry, PlaneGeometry, PlaneBufferGeometry, LatheGeometry, LatheBufferGeometry, ShapeGeometry, ShapeBufferGeometry, ExtrudeGeometry, ExtrudeBufferGeometry, EdgesGeometry, ConeGeometry, ConeBufferGeometry, CylinderGeometry, CylinderBufferGeometry, CircleGeometry, CircleBufferGeometry, BoxGeometry, BoxGeometry as CubeGeometry, BoxBufferGeometry, ShadowMaterial, SpriteMaterial, RawShaderMaterial, ShaderMaterial, PointsMaterial, MeshPhysicalMaterial, MeshStandardMaterial, MeshPhongMaterial, MeshToonMaterial, MeshNormalMaterial, MeshLambertMaterial, MeshDepthMaterial, MeshDistanceMaterial, MeshBasicMaterial, MeshMatcapMaterial, LineDashedMaterial, LineBasicMaterial, Material, Float64BufferAttribute, Float32BufferAttribute, Uint32BufferAttribute, Int32BufferAttribute, Uint16BufferAttribute, Int16BufferAttribute, Uint8ClampedBufferAttribute, Uint8BufferAttribute, Int8BufferAttribute, BufferAttribute, ArcCurve, CatmullRomCurve3, CubicBezierCurve, CubicBezierCurve3, EllipseCurve, LineCurve, LineCurve3, QuadraticBezierCurve, QuadraticBezierCurve3, SplineCurve, REVISION, MOUSE, CullFaceNone, CullFaceBack, CullFaceFront, CullFaceFrontBack, FrontFaceDirectionCW, FrontFaceDirectionCCW, BasicShadowMap, PCFShadowMap, PCFSoftShadowMap, FrontSide, BackSide, DoubleSide, FlatShading, SmoothShading, NoColors, FaceColors, VertexColors, NoBlending, NormalBlending, AdditiveBlending, SubtractiveBlending, MultiplyBlending, CustomBlending, AddEquation, SubtractEquation, ReverseSubtractEquation, MinEquation, MaxEquation, ZeroFactor, OneFactor, SrcColorFactor, OneMinusSrcColorFactor, SrcAlphaFactor, OneMinusSrcAlphaFactor, DstAlphaFactor, OneMinusDstAlphaFactor, DstColorFactor, OneMinusDstColorFactor, SrcAlphaSaturateFactor, NeverDepth, AlwaysDepth, LessDepth, LessEqualDepth, EqualDepth, GreaterEqualDepth, GreaterDepth, NotEqualDepth, MultiplyOperation, MixOperation, AddOperation, NoToneMapping, LinearToneMapping, ReinhardToneMapping, Uncharted2ToneMapping, CineonToneMapping, ACESFilmicToneMapping, UVMapping, CubeReflectionMapping, CubeRefractionMapping, EquirectangularReflectionMapping, EquirectangularRefractionMapping, SphericalReflectionMapping, CubeUVReflectionMapping, CubeUVRefractionMapping, RepeatWrapping, ClampToEdgeWrapping, MirroredRepeatWrapping, NearestFilter, NearestMipMapNearestFilter, NearestMipMapLinearFilter, LinearFilter, LinearMipMapNearestFilter, LinearMipMapLinearFilter, UnsignedByteType, ByteType, ShortType, UnsignedShortType, IntType, UnsignedIntType, FloatType, HalfFloatType, UnsignedShort4444Type, UnsignedShort5551Type, UnsignedShort565Type, UnsignedInt248Type, AlphaFormat, RGBFormat, RGBAFormat, LuminanceFormat, LuminanceAlphaFormat, RGBEFormat, DepthFormat, DepthStencilFormat, RedFormat, RGB_S3TC_DXT1_Format, RGBA_S3TC_DXT1_Format, RGBA_S3TC_DXT3_Format, RGBA_S3TC_DXT5_Format, RGB_PVRTC_4BPPV1_Format, RGB_PVRTC_2BPPV1_Format, RGBA_PVRTC_4BPPV1_Format, RGBA_PVRTC_2BPPV1_Format, RGB_ETC1_Format, RGBA_ASTC_4x4_Format, RGBA_ASTC_5x4_Format, RGBA_ASTC_5x5_Format, RGBA_ASTC_6x5_Format, RGBA_ASTC_6x6_Format, RGBA_ASTC_8x5_Format, RGBA_ASTC_8x6_Format, RGBA_ASTC_8x8_Format, RGBA_ASTC_10x5_Format, RGBA_ASTC_10x6_Format, RGBA_ASTC_10x8_Format, RGBA_ASTC_10x10_Format, RGBA_ASTC_12x10_Format, RGBA_ASTC_12x12_Format, LoopOnce, LoopRepeat, LoopPingPong, InterpolateDiscrete, InterpolateLinear, InterpolateSmooth, ZeroCurvatureEnding, ZeroSlopeEnding, WrapAroundEnding, TrianglesDrawMode, TriangleStripDrawMode, TriangleFanDrawMode, LinearEncoding, sRGBEncoding, GammaEncoding, RGBEEncoding, LogLuvEncoding, RGBM7Encoding, RGBM16Encoding, RGBDEncoding, BasicDepthPacking, RGBADepthPacking, TangentSpaceNormalMap, ObjectSpaceNormalMap, Face4, LineStrip, LinePieces, MeshFaceMaterial, MultiMaterial, PointCloud, Particle, ParticleSystem, PointCloudMaterial, ParticleBasicMaterial, ParticleSystemMaterial, Vertex, DynamicBufferAttribute, Int8Attribute, Uint8Attribute, Uint8ClampedAttribute, Int16Attribute, Uint16Attribute, Int32Attribute, Uint32Attribute, Float32Attribute, Float64Attribute, ClosedSplineCurve3, SplineCurve3, Spline, AxisHelper, BoundingBoxHelper, EdgesHelper, WireframeHelper, XHRLoader, BinaryTextureLoader, GeometryUtils, CanvasRenderer, JSONLoader, SceneUtils, LensFlare };
