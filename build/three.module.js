@@ -34531,8 +34531,6 @@ Object.assign( AnimationClip.prototype, {
 // by loading.<key>.manager = [ <manager>, ... ]
 var loading = {};
 
-var dataUriRegex = /^data:(.*?)(;base64)?,(.*)$/;
-
 var Cache = {
 
 	enabled: false,
@@ -34577,79 +34575,16 @@ var Cache = {
 
 		}
 
-		// Check if request is duplicate
-
 		if ( loading[ key ] !== undefined ) {
 
-			if ( ! loading[ key ].manager.includes(loader.manager) ) {
-
-				loader.manager.itemStart( key );
-
-				loading[ key ].manager.push(loader.manager);
-
-			}
-
-			loading[ key ].load.push( {
-
-				loader: loader,
-				onLoad: onLoad,
-				onProgress: onProgress,
-				onError: onError
-
-			} );
+			this.duplicate( loader, key, onLoad, onProgress, onError );
 
 			return;
 
 		}
 
-		var dataUriRegexResult = key.match( dataUriRegex );
+		this.load(loader, key, onLoad, onProgress, onError);
 
-		if ( dataUriRegexResult ) {
-
-			loader.manager.itemStart( key );
-
-			this.dataURI(key, loader, onLoad, dataUriRegexResult);
-
-			loader.manager.itemEnd( key );
-
-			return;
-
-		} else {
-
-			// Initialize callback for duplicate request
-
-			loading[ key ] = {
-				manager: [],
-				load: []
-			};
-
-			loading[ key ].manager.push( loader.manager );
-
-			loading[ key ].load.push( {
-
-				loader: loader,
-				onLoad: onLoad,
-				onProgress: onProgress,
-				onError: onError
-
-			} );
-
-			// get key
-
-			var request = loader.request( key );
-
-			request.addEventListener( 'load', this.load.bind(this,key) );
-			request.addEventListener( 'progress', this.progress.bind(this,key) );
-			request.addEventListener( 'error', this.error.bind(this,key) );
-			request.addEventListener( 'abort', this.abort.bind(this,key) );
-
-			request.send( null );
-
-			loader.manager.itemStart( key );
-
-			return request;
-
-		}
 
 	},
 
@@ -34691,7 +34626,71 @@ var Cache = {
 
 	},
 
-	load: function ( key, event ) {
+	loaderload: function (key,data) {
+
+		// perform each unique loader result processing
+
+		var unique = this.uniquetypes(key);
+                var alt = this;
+
+		Promise.all( unique.map( function( loader ) {
+			return alt.resultprocess(loader,data).catch(function(error){return error})})
+		).then(function( results ) {
+
+			// all processed now do house keeping
+
+			// index results by loader type
+			var indexed = {};
+
+			for (var i in results) {
+
+				indexed[unique[i].constructor.name] = results[i];
+
+				// cache all valid results
+				if (! (results[i].constructor.name == 'Error')) {
+
+					alt.add( unique[i].constructor.name, key, results[i] );
+
+				}
+
+			}
+
+			// generate all appropriate events for
+			// managers/loaders based on key results
+			var callbacks = loading[ key ];
+
+			delete loading[ key ];
+
+			for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
+
+				var callback = callbacks.load[ i ];
+
+				if (indexed[callback.loader.constructor.name] == 'Error') {
+					var error = indexed[callback.loader.constructor.name];
+					if ( callback.onError ) callback.onError( error );
+
+					callback.loader.manager.itemError( key );
+				} else {
+					var data = indexed[callback.loader.constructor.name];
+
+					if ( callback.onLoad ) callback.onLoad( data );
+				}
+
+			}
+
+			// notify managers we are done.
+			for (var i = 0, il = callbacks.manager.length; i < il; i++) {
+
+				var manager = callbacks.manager[ i ];
+				manager.itemEnd( key );
+
+			}
+
+		});
+
+	},
+
+	xhrload: function ( key, event ) {
 
 		if ( event.target.status === 200 || event.target.status === 0 ) {
 
@@ -34704,72 +34703,7 @@ var Cache = {
 
 			this.add( event.target.constructor.name, key, response );
 
-			// perform each unique loader result processing
-
-			var unique = this.uniquetypes(key);
-                        var rp = this.resultprocess.bind(this);
-                        var a = this.add.bind(this);
-
-			Promise.all( unique.map( function(loader) { 
-					return rp(loader,
-						response).catch(function(error) {
-						return error;
-						});
-					}
-				)
-			).then(function(results) {
-
-				// all processed now do house keeping
-
-				// index results by loader type
-				var indexed = {};
-
-				for (var i in results) {
-
-					indexed[unique[i].constructor.name] = results[i];
-
-					// cache all valid results
-					if (! (results[i].constructor.name == 'Error')) {
-
-						a( unique[i].constructor.name, key, results[i] );
-
-					}
-
-				}
-
-				// generate all appropriate events for
-				// managers/loaders based on key results
-				var callbacks = loading[ key ];
-
-				delete loading[ key ];
-
-				for ( var i = 0, il = callbacks.load.length; i < il; i ++ ) {
-
-					var callback = callbacks.load[ i ];
-
-					if (indexed[callback.loader.constructor.name] == 'Error') {
-						var error = indexed[callback.loader.constructor.name];
-						if ( callback.onError ) callback.onError( error );
-
-						callback.loader.manager.itemError( key );
-					} else {
-						var data = indexed[callback.loader.constructor.name];
-
-						if ( callback.onLoad ) callback.onLoad( data );
-					}
-
-				}
-
-				// notify managers we are done.
-				for (var i = 0, il = callbacks.manager.length; i < il; i++) {
-
-					var manager = callbacks.manager[ i ];
-					manager.itemEnd( key );
-
-				}
-
-
-			});
+			this.loaderload(key,response);
 
 		} else {
 
@@ -34854,94 +34788,73 @@ var Cache = {
 
 	},
 
+	duplicate: function ( loader, key, onLoad, onProgress, onError ) {
 
-	dataURI: function ( key, loader, onLoad, result ) {
+		// track duplicate requests
 
-		var mimeType = result[ 1 ];
-		var isBase64 = !! result[ 2 ];
-		var data = result[ 3 ];
+		if ( ! loading[ key ].manager.includes(loader.manager) ) {
 
-		data = decodeURIComponent( data );
+			loader.manager.itemStart( key );
 
-		if ( isBase64 ) data = atob( data );
+			loading[ key ].manager.push(loader.manager);
 
-		try {
+		}
 
-			var response;
-			var responseType = ( loader.responseType || '' ).toLowerCase();
+		loading[ key ].load.push( {
 
-			switch ( responseType ) {
+			loader: loader,
+			onLoad: onLoad,
+			onProgress: onProgress,
+			onError: onError
 
-				case 'arraybuffer':
-				case 'blob':
+		} );
 
-					var view = new Uint8Array( data.length );
+	},
 
-					for ( var i = 0; i < data.length; i ++ ) {
+	initloading: function ( loader, key, onLoad, onProgress, onError ) {
 
-						view[ i ] = data.charCodeAt( i );
+		// Initialize callback for duplicate request
 
-					}
+		loading[ key ] = {
+			manager: [],
+			load: []
+		};
 
-					if ( responseType === 'blob' ) {
+		loading[ key ].manager.push( loader.manager );
 
-						response = new Blob( [ view.buffer ], { type: mimeType } );
+		loading[ key ].load.push( {
 
-					} else {
+			loader: loader,
+			onLoad: onLoad,
+			onProgress: onProgress,
+			onError: onError
 
-						response = view.buffer;
+		} );
 
-					}
+        },
 
-					break;
+	load: function ( loader, key, onLoad, onProgress, onError ) {
 
-				case 'image':
-				case 'imagebitmap':
-					var i = document.createElement('img');
-					i.src = key;
-					response = i;
+		this.initloading( loader, key, onLoad, onProgress, onError );
 
-					break;
-				case 'document':
+		loader.manager.itemStart( key );
 
-					var parser = new DOMParser();
-					response = parser.parseFromString( data, mimeType );
+		if ( 'XMLHttpRequest' in this.files &&
+                     key in this.files.XMLHttpRequest ) {
 
-					break;
+			this.loaderload( key, this.files.XMLHttpRequest[key] );
 
-				case 'json':
+		} else {
 
-					response = JSON.parse( data );
+			// get key
+			var request = loader.request( key );
 
-					break;
+			request.addEventListener( 'load', this.xhrload.bind(this,key) );
+			request.addEventListener( 'progress', this.progress.bind(this,key) );
+			request.addEventListener( 'error', this.error.bind(this,key) );
+			request.addEventListener( 'abort', this.abort.bind(this,key) );
 
-				default: // 'text' or other
-
-					response = data;
-
-					break;
-
-			}
-
-
-			// Wait for next browser tick like standard XMLHttpRequest event dispatching does
-			setTimeout( function () {
-
-				if ( onLoad ) onLoad( response );
-
-				loader.manager.itemEnd( key );
-
-			}, 0 );
-
-		} catch ( error ) {
-
-			// Wait for next browser tick like standard XMLHttpRequest event dispatching does
-			setTimeout( function () {
-
-				loader.manager.itemError( key );
-				loader.manager.itemEnd( key );
-
-			}, 0 );
+			request.send( null );
 
 		}
 
